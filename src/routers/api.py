@@ -1,0 +1,621 @@
+# import os
+# import glob
+# import json
+# import shutil
+# import tempfile
+
+# import torch
+# from zipfile import ZipFile
+# from PIL import Image
+# from fastapi import APIRouter, File, UploadFile, HTTPException
+# from fastapi.responses import JSONResponse
+# from transformers import AutoModel, AutoProcessor, AutoConfig
+
+# from model.model import CheXagentSigLIPBinary
+# from utils.utils import dicom_to_image
+# from src.configuration.config import DICOM_TEMP_PATH, outputDir
+
+
+# # ──────────────────────────────────────────────
+# # Config
+# # ──────────────────────────────────────────────
+# MODEL_NAME = "StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
+# CHECKPOINT = "/media/omen/392571a8-91fe-4ff9-aac6-79d0409b1b3f/home/omen/Documents/Megha/tb_work/training_with_attention_loss/best_model_attention_loss.pth"
+# dtype  = torch.float32
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# os.makedirs(DICOM_TEMP_PATH, exist_ok=True)
+# os.makedirs(outputDir, exist_ok=True)
+
+
+# # ──────────────────────────────────────────────
+# # Load model ONCE at module import (not per request)
+# # ──────────────────────────────────────────────
+# print("[startup] Loading XraySigLIP processor ...")
+# processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+# print("[startup] Loading vision encoder ...")
+# _config      = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+# _vision_full = AutoModel.from_pretrained(
+#     MODEL_NAME, config=_config, trust_remote_code=True
+# ).to(device, dtype)
+# vision_encoder = _vision_full.vision_model
+# del _vision_full                                  # free the text tower
+
+# print("[startup] Loading CheXagentSigLIPBinary checkpoint ...")
+# _model = CheXagentSigLIPBinary(vision_encoder=vision_encoder)
+# _ckpt  = torch.load(CHECKPOINT, map_location=device)
+# _model.load_state_dict(_ckpt["model_state"])
+# _model.to(device).eval()
+# print("[startup] Model ready.")
+
+
+# # ──────────────────────────────────────────────
+# # Router
+# # ──────────────────────────────────────────────
+# router = APIRouter()
+
+
+# # ──────────────────────────────────────────────
+# # Helper — image preprocessing
+# # ──────────────────────────────────────────────
+# def preprocess_image(image_path: str) -> torch.Tensor:
+#     """
+#     Open a PNG/JPG chest X-ray, handle 16-bit DICOM artifacts,
+#     convert to RGB, run through XraySigLIP processor.
+
+#     Returns pixel_values of shape (1, C, H, W) on the correct device.
+#     """
+#     image = Image.open(image_path)
+
+#     # ── Handle 16-bit DICOM grayscale (mode "I;16") ──────────────────────
+#     # if image.mode == "I;16":
+#     #     image = image.convert("I")                              # 32-bit int
+#     #     image = image.point(lambda p: p * (255.0 / 65535.0))   # normalise
+#     #     image = image.convert("L")                              # 8-bit gray
+
+#     # ── Convert any mode (L, RGBA, P ...) to RGB ─────────────────────────
+#     image = image.convert("RGB")
+
+#     # ── XraySigLIP processor ─────────────────────────────────────────────
+#     inputs       = processor(images=image, return_tensors="pt")
+#     pixel_values = inputs["pixel_values"]            # (1, C, H, W)
+#     pixel_values = pixel_values.to(device, dtype)
+
+#     return pixel_values
+
+
+# # ──────────────────────────────────────────────
+# # ENDPOINT 1 — POST /predictdiseasev2/
+# # ──────────────────────────────────────────────
+# @router.post("/predictdiseasev2/")
+# async def predict_disease_v2(file: UploadFile = File(...)):
+#     """
+#     Upload a ZIP containing a DICOM chest X-ray.
+#     Runs TB classification.
+#     Returns file_id to fetch result via GET /json/{file_id}
+#     """
+#     temp_dir = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+
+#     try:
+#         # ── 1. Save uploaded ZIP ─────────────────────────────────────────
+#         temp_file = os.path.join(temp_dir, file.filename)
+#         with open(temp_file, "wb") as out_file:
+#             out_file.write(await file.read())
+
+#         # ── 2. Extract ZIP ───────────────────────────────────────────────
+#         with ZipFile(temp_file, "r") as zip_ref:
+#             root_dir = zip_ref.namelist()[0].split("/")[0]
+#             zip_ref.extractall(temp_dir)
+
+#         root_dir_path = os.path.join(temp_dir, root_dir)
+
+#         # ── 3. Find first DICOM file ─────────────────────────────────────
+#         file_paths  = glob.glob(root_dir_path + "/**/*.dcm",   recursive=True)
+#         file_paths += glob.glob(os.path.join(temp_dir, "**", "*.dicom"), recursive=True)
+
+#         if not file_paths:
+#             return JSONResponse(
+#                 status_code=400,
+#                 content={"error": "No .dcm file found inside the ZIP."}
+#             )
+
+#         dicom_path  = file_paths[0]
+#         print("DICOM FILE:", dicom_path)
+#         output_path = os.path.splitext(dicom_path)[0] + ".png"
+
+#         # ── 4. DICOM → PNG ───────────────────────────────────────────────
+#         dicom_to_image(dicom_path, output_path, format="png")
+
+#         # ── 5. Preprocess image ──────────────────────────────────────────
+#         pixel_values = preprocess_image(output_path)   # (1, C, H, W)
+
+#         # ── 6. Inference ─────────────────────────────────────────────────
+#         with torch.no_grad():
+#             logits, attention, pooling_attn_weights = _model(pixel_values)
+#             # logits shape: (1, 1)
+
+#         # ── 7. Post-process ──────────────────────────────────────────────
+#         prob    = torch.sigmoid(logits).squeeze().item()   # scalar float
+#         pred    = 1 if prob >= 0.5 else 0
+#         finding = "TB positive" if pred == 1 else "Normal"
+
+#         # ── 8. Save finding to predictions.json ──────────────────────────
+#         predictions   = {"finding": finding}
+#         json_filepath = os.path.join(outputDir, "predictions.json")
+
+#         with open(json_filepath, "w", encoding="utf-8") as json_file:
+#             json.dump(predictions, json_file, indent=4)
+
+#         # ── 9. Move JSON to fresh temp dir, return file_id ───────────────
+#         # caller uses file_id to fetch result via GET /json/{file_id}
+#         temp_dir_return = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+#         shutil.move(json_filepath, temp_dir_return)
+
+#         return JSONResponse(content={
+#             "file_id": os.path.basename(temp_dir_return)
+#         })
+
+#     except Exception as e:
+#         return JSONResponse(
+#             status_code=500,
+#             content={"error": str(e)}
+#         )
+
+#     finally:
+#         # ── Clean up upload temp dir ──────────────────────────────────────
+#         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# # ──────────────────────────────────────────────
+# # ENDPOINT 2 — GET /json/{temp_dir}
+# # ──────────────────────────────────────────────
+# @router.get("/json/{temp_dir}")
+# async def get_json_object(temp_dir: str):
+#     """
+#     Fetch TB finding result using file_id returned from /predictdiseasev2/
+
+#     Returns:
+#         { "finding": "Normal" }
+#         { "finding": "TB positive" }
+#     """
+#     path     = os.path.join(DICOM_TEMP_PATH, temp_dir, "predictions.json")
+#     dir_path = os.path.join(DICOM_TEMP_PATH, temp_dir)
+
+#     try:
+#         if os.path.exists(path):
+#             with open(path) as f:
+#                 data = json.load(f)
+#             return data
+#         else:
+#             raise HTTPException(status_code=404, detail="File not found")
+
+#     except Exception as e:
+#         raise e
+
+#     finally:
+#         # Clean up temp dir after reading
+#         if os.path.exists(path):
+#             os.remove(path)
+#         if os.path.exists(dir_path) and not os.listdir(dir_path):
+#             os.rmdir(dir_path)
+
+
+
+
+
+# import os
+# import glob
+# import json
+# import shutil
+# import tempfile
+
+# import torch
+# from zipfile import ZipFile
+# from PIL import Image
+# from fastapi import APIRouter, File, UploadFile, HTTPException
+# from fastapi.responses import JSONResponse
+# from transformers import AutoModel, AutoProcessor, AutoConfig
+
+# from model.model import CheXagentSigLIPBinary
+# from utils.utils import dicom_to_image
+# from src.configuration.config import DICOM_TEMP_PATH, outputDir
+
+
+# # ──────────────────────────────────────────────
+# # Config
+# # ──────────────────────────────────────────────
+# MODEL_NAME = "StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
+# CHECKPOINT = "/media/omen/392571a8-91fe-4ff9-aac6-79d0409b1b3f/home/omen/Documents/Megha/tb_work/training_with_attention_loss/best_model_attention_loss.pth"
+# dtype  = torch.float32
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# os.makedirs(DICOM_TEMP_PATH, exist_ok=True)
+# os.makedirs(outputDir, exist_ok=True)
+
+
+# # ──────────────────────────────────────────────
+# # Load model ONCE at module import (not per request)
+# # ──────────────────────────────────────────────
+# print("[startup] Loading XraySigLIP processor ...")
+# processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+# print("[startup] Loading vision encoder ...")
+# _config      = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+# _vision_full = AutoModel.from_pretrained(
+#     MODEL_NAME, config=_config, trust_remote_code=True
+# ).to(device, dtype)
+# vision_encoder = _vision_full.vision_model
+# del _vision_full                                  # free the text tower
+
+# print("[startup] Loading CheXagentSigLIPBinary checkpoint ...")
+# _model = CheXagentSigLIPBinary(vision_encoder=vision_encoder)
+# _ckpt  = torch.load(CHECKPOINT, map_location=device)
+# _model.load_state_dict(_ckpt["model_state"])
+# _model.to(device).eval()
+# print("[startup] Model ready.")
+
+
+# # ──────────────────────────────────────────────
+# # Router
+# # ──────────────────────────────────────────────
+# router = APIRouter()
+
+
+# from src.routers import api
+# app.include_router(api.router, tags=["TB Detection"])
+
+
+# # ──────────────────────────────────────────────
+# # Helper — image preprocessing
+# # ──────────────────────────────────────────────
+# def preprocess_image(image_path: str) -> torch.Tensor:
+#     """
+#     Open a PNG/JPG chest X-ray, handle 16-bit DICOM artifacts,
+#     convert to RGB, run through XraySigLIP processor.
+
+#     Returns pixel_values of shape (1, C, H, W) on the correct device.
+#     """
+#     image = Image.open(image_path)
+
+#     # ── Handle 16-bit DICOM grayscale (mode "I;16") ──────────────────────
+#     # if image.mode == "I;16":
+#     #     image = image.convert("I")                              # 32-bit int
+#     #     image = image.point(lambda p: p * (255.0 / 65535.0))   # normalise
+#     #     image = image.convert("L")                              # 8-bit gray
+
+#     # ── Convert any mode (L, RGBA, P ...) to RGB ─────────────────────────
+#     image = image.convert("RGB")
+
+#     # ── XraySigLIP processor ─────────────────────────────────────────────
+#     inputs       = processor(images=image, return_tensors="pt")
+#     pixel_values = inputs["pixel_values"]            # (1, C, H, W)
+#     pixel_values = pixel_values.to(device, dtype)
+
+#     return pixel_values
+
+
+# # ──────────────────────────────────────────────
+# # ENDPOINT 1 — POST /predictdiseasev2/
+# # ──────────────────────────────────────────────
+# @router.post("/predictdiseasev2/")
+# async def predict_disease_v2(file: UploadFile = File(...)):
+#     """
+#     Upload a ZIP containing a DICOM chest X-ray.
+#     Runs TB classification.
+
+#     Returns:
+#         { "file_id": "tmpXXXXXX" }
+
+#     Use file_id to fetch result via:
+#         GET /json/{file_id}
+#     """
+#     temp_dir = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+
+#     try:
+#         # ── 1. Save uploaded ZIP ─────────────────────────────────────────
+#         temp_file = os.path.join(temp_dir, file.filename)
+#         with open(temp_file, "wb") as out_file:
+#             out_file.write(await file.read())
+
+#         # ── 2. Extract ZIP ───────────────────────────────────────────────
+#         with ZipFile(temp_file, "r") as zip_ref:
+#             root_dir = zip_ref.namelist()[0].split("/")[0]
+#             zip_ref.extractall(temp_dir)
+
+#         root_dir_path = os.path.join(temp_dir, root_dir)
+
+#         # ── 3. Find first DICOM file ─────────────────────────────────────
+#         file_paths  = glob.glob(root_dir_path + "/**/*.dcm", recursive=True)
+#         file_paths += glob.glob(os.path.join(temp_dir, "**", "*.dicom"), recursive=True)
+
+#         if not file_paths:
+#             return JSONResponse(
+#                 status_code=400,
+#                 content={"error": "No .dcm file found inside the ZIP."}
+#             )
+
+#         dicom_path  = file_paths[0]
+#         print("DICOM FILE:", dicom_path)
+#         output_path = os.path.splitext(dicom_path)[0] + ".png"
+
+#         # ── 4. DICOM → PNG ───────────────────────────────────────────────
+#         dicom_to_image(dicom_path, output_path, format="png")
+
+#         # ── 5. Preprocess image ──────────────────────────────────────────
+#         pixel_values = preprocess_image(output_path)   # (1, C, H, W)
+
+#         # ── 6. Inference ─────────────────────────────────────────────────
+#         with torch.no_grad():
+#             logits, attention, pooling_attn_weights = _model(pixel_values)
+#             # logits shape: (1, 1)
+
+#         # ── 7. Post-process ──────────────────────────────────────────────
+#         prob    = torch.sigmoid(logits).squeeze().item()   # scalar float
+#         pred    = 1 if prob >= 0.5 else 0
+#         finding = "TB positive" if pred == 1 else "Normal"
+
+#         # ── 8. Save finding to predictions.json ──────────────────────────
+#         predictions   = {"finding": finding}
+#         json_filepath = os.path.join(outputDir, "predictions.json")
+
+#         with open(json_filepath, "w", encoding="utf-8") as json_file:
+#             json.dump(predictions, json_file, indent=4)
+
+#         # ── 9. Move JSON to fresh temp dir, return file_id ───────────────
+#         temp_dir_return = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+#         shutil.move(json_filepath, temp_dir_return)
+
+#         return JSONResponse(content={
+#             "file_id": os.path.basename(temp_dir_return)
+#         })
+
+#     except Exception as e:
+#         return JSONResponse(
+#             status_code=500,
+#             content={"error": str(e)}
+#         )
+
+#     finally:
+#         # ── Clean up upload temp dir ──────────────────────────────────────
+#         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# # ──────────────────────────────────────────────
+# # ENDPOINT 2 — GET /json/{file_id}
+# # ──────────────────────────────────────────────
+# @router.get("/json/{file_id}")
+# async def get_json_object(file_id: str):
+#     """
+#     Fetch TB finding result using file_id returned from /predictdiseasev2/
+
+#     Returns:
+#         { "finding": "Normal" }
+#         { "finding": "TB positive" }
+#     """
+#     path     = os.path.join(DICOM_TEMP_PATH, file_id, "predictions.json")
+#     dir_path = os.path.join(DICOM_TEMP_PATH, file_id)
+
+#     try:
+#         if os.path.exists(path):
+#             with open(path) as f:
+#                 data = json.load(f)
+#             return data
+#         else:
+#             raise HTTPException(status_code=404, detail="File not found")
+
+#     except Exception as e:
+#         raise e
+
+#     finally:
+#         # Clean up temp dir after reading
+#         if os.path.exists(path):
+#             os.remove(path)
+#         if os.path.exists(dir_path) and not os.listdir(dir_path):
+#             os.rmdir(dir_path)
+
+
+
+
+
+import os
+import glob
+import json
+import shutil
+import tempfile
+
+import torch
+from zipfile import ZipFile
+from PIL import Image
+from fastapi import APIRouter, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from transformers import AutoModel, AutoProcessor, AutoConfig
+
+from model.model import CheXagentSigLIPBinary
+from utils.utils import dicom_to_image
+from src.configuration.config import DICOM_TEMP_PATH, outputDir
+
+
+# ──────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────
+MODEL_NAME = "StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
+CHECKPOINT = "/media/omen/392571a8-91fe-4ff9-aac6-79d0409b1b3f/home/omen/Documents/Megha/tb_work/training_with_attention_loss/best_model_attention_loss.pth"
+dtype  = torch.float32
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+os.makedirs(DICOM_TEMP_PATH, exist_ok=True)
+os.makedirs(outputDir, exist_ok=True)
+
+
+# ──────────────────────────────────────────────
+# Load model ONCE at module import (not per request)
+# ──────────────────────────────────────────────
+print("[startup] Loading XraySigLIP processor ...")
+processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+print("[startup] Loading vision encoder ...")
+_config      = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+_vision_full = AutoModel.from_pretrained(
+    MODEL_NAME, config=_config, trust_remote_code=True
+).to(device, dtype)
+vision_encoder = _vision_full.vision_model
+del _vision_full                                  # free the text tower
+
+print("[startup] Loading CheXagentSigLIPBinary checkpoint ...")
+_model = CheXagentSigLIPBinary(vision_encoder=vision_encoder)
+_ckpt  = torch.load(CHECKPOINT, map_location=device)
+_model.load_state_dict(_ckpt["model_state"])
+_model.to(device).eval()
+print("[startup] Model ready.")
+
+
+# ──────────────────────────────────────────────
+# ONE router only — do not declare this twice
+# ──────────────────────────────────────────────
+router = APIRouter(tags=["TB Detection"])
+
+
+# ──────────────────────────────────────────────
+# Helper — image preprocessing
+# ──────────────────────────────────────────────
+def preprocess_image(image_path: str) -> torch.Tensor:
+    """
+    Open a PNG/JPG chest X-ray, handle 16-bit DICOM artifacts,
+    convert to RGB, run through XraySigLIP processor.
+
+    Returns pixel_values of shape (1, C, H, W) on the correct device.
+    """
+    image = Image.open(image_path)
+
+    # ── Convert any mode (L, RGBA, P ...) to RGB ─────────────────────────
+    image = image.convert("RGB")
+
+    # ── XraySigLIP processor ─────────────────────────────────────────────
+    inputs       = processor(images=image, return_tensors="pt")
+    pixel_values = inputs["pixel_values"]            # (1, C, H, W)
+    pixel_values = pixel_values.to(device, dtype)
+
+    return pixel_values
+
+
+# ──────────────────────────────────────────────
+# ENDPOINT 1 — POST /predictdiseasev2/
+# Step 1 of 2: upload ZIP, run inference, get file_id
+# ──────────────────────────────────────────────
+@router.post("/predictdiseasev2/")
+async def predict_disease_v2(file: UploadFile = File(...)):
+    """
+    Upload a ZIP containing a DICOM chest X-ray.
+    Runs TB classification.
+
+    Returns:
+        { "file_id": "tmpXXXXXX" }
+
+    Then call GET /json/{file_id} to get the finding.
+    """
+    temp_dir = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+
+    try:
+        # ── 1. Save uploaded ZIP ─────────────────────────────────────────
+        temp_file = os.path.join(temp_dir, file.filename)
+        with open(temp_file, "wb") as out_file:
+            out_file.write(await file.read())
+
+        # ── 2. Extract ZIP ───────────────────────────────────────────────
+        with ZipFile(temp_file, "r") as zip_ref:
+            root_dir = zip_ref.namelist()[0].split("/")[0]
+            zip_ref.extractall(temp_dir)
+
+        root_dir_path = os.path.join(temp_dir, root_dir)
+
+        # ── 3. Find first DICOM file ─────────────────────────────────────
+        file_paths  = glob.glob(root_dir_path + "/**/*.dcm", recursive=True)
+        file_paths += glob.glob(os.path.join(temp_dir, "**", "*.dicom"), recursive=True)
+
+        if not file_paths:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No .dcm file found inside the ZIP."}
+            )
+
+        dicom_path  = file_paths[0]
+        print("DICOM FILE:", dicom_path)
+        output_path = os.path.splitext(dicom_path)[0] + ".png"
+
+        # ── 4. DICOM → PNG ───────────────────────────────────────────────
+        dicom_to_image(dicom_path, output_path, format="png")
+
+        # ── 5. Preprocess image ──────────────────────────────────────────
+        pixel_values = preprocess_image(output_path)   # (1, C, H, W)
+
+        # ── 6. Inference ─────────────────────────────────────────────────
+        with torch.no_grad():
+            logits, attention, pooling_attn_weights = _model(pixel_values)
+            # logits shape: (1, 1)
+
+        # ── 7. Post-process ──────────────────────────────────────────────
+        prob    = torch.sigmoid(logits).squeeze().item()   # scalar float
+        pred    = 1 if prob >= 0.5 else 0
+        finding = "TB positive" if pred == 1 else "Normal"
+
+        # ── 8. Save finding to predictions.json ──────────────────────────
+        predictions   = {"finding": finding}
+        json_filepath = os.path.join(outputDir, "predictions.json")
+
+        with open(json_filepath, "w", encoding="utf-8") as json_file:
+            json.dump(predictions, json_file, indent=4)
+
+        # ── 9. Move JSON to fresh temp dir, return file_id ───────────────
+        temp_dir_return = tempfile.mkdtemp(dir=DICOM_TEMP_PATH)
+        shutil.move(json_filepath, temp_dir_return)
+
+        return JSONResponse(content={
+            "file_id": os.path.basename(temp_dir_return)
+        })
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+    finally:
+        # ── Clean up upload temp dir ──────────────────────────────────────
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ──────────────────────────────────────────────
+# ENDPOINT 2 — GET /json/{file_id}
+# Step 2 of 2: fetch finding using file_id
+# ──────────────────────────────────────────────
+@router.get("/json/{file_id}")
+async def get_json_object(file_id: str):
+    """
+    Fetch TB finding result using file_id returned from /predictdiseasev2/
+
+    Returns:
+        { "finding": "Normal" }
+        or
+        { "finding": "TB positive" }
+    """
+    path     = os.path.join(DICOM_TEMP_PATH, file_id, "predictions.json")
+    dir_path = os.path.join(DICOM_TEMP_PATH, file_id)
+
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            return data
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
+
+    except Exception as e:
+        raise e
+
+    finally:
+        # Clean up temp dir after reading
+        if os.path.exists(path):
+            os.remove(path)
+        if os.path.exists(dir_path) and not os.listdir(dir_path):
+            os.rmdir(dir_path)
